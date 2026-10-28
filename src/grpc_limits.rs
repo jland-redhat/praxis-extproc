@@ -98,21 +98,22 @@ fn u128_to_usize(v: u128) -> Result<usize, String> {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
 
     #[test]
     fn empty_uses_default() {
         assert_eq!(
-            resolve_grpc_max_recv_msg_size_from(None).unwrap(),
+            resolve_grpc_max_recv_msg_size_from(None).expect("empty env uses default"),
             DEFAULT_GRPC_MAX_RECV_MSG_SIZE
         );
         assert_eq!(
-            resolve_grpc_max_recv_msg_size_from(Some("")).unwrap(),
+            resolve_grpc_max_recv_msg_size_from(Some("")).expect("blank env uses default"),
             DEFAULT_GRPC_MAX_RECV_MSG_SIZE
         );
         assert_eq!(
-            resolve_grpc_max_recv_msg_size_from(Some("  \t ")).unwrap(),
+            resolve_grpc_max_recv_msg_size_from(Some("  \t ")).expect("whitespace env uses default"),
             DEFAULT_GRPC_MAX_RECV_MSG_SIZE
         );
     }
@@ -120,19 +121,19 @@ mod tests {
     #[test]
     fn plain_bytes_and_quantities() {
         assert_eq!(
-            resolve_grpc_max_recv_msg_size_from(Some("67108864")).unwrap(),
+            resolve_grpc_max_recv_msg_size_from(Some("67108864")).expect("plain bytes"),
             64 * 1024 * 1024
         );
         assert_eq!(
-            resolve_grpc_max_recv_msg_size_from(Some("32Mi")).unwrap(),
+            resolve_grpc_max_recv_msg_size_from(Some("32Mi")).expect("binary MiB"),
             32 * 1024 * 1024
         );
         assert_eq!(
-            resolve_grpc_max_recv_msg_size_from(Some("1Gi")).unwrap(),
+            resolve_grpc_max_recv_msg_size_from(Some("1Gi")).expect("binary GiB"),
             1024 * 1024 * 1024
         );
         assert_eq!(
-            resolve_grpc_max_recv_msg_size_from(Some("64M")).unwrap(),
+            resolve_grpc_max_recv_msg_size_from(Some("64M")).expect("decimal MB"),
             64 * 1000 * 1000
         );
     }
@@ -149,6 +150,8 @@ mod tests {
 
     #[test]
     fn default_above_grpc_compiled() {
-        assert!(DEFAULT_GRPC_MAX_RECV_MSG_SIZE > GRPC_COMPILED_MAX_RECV_DEFAULT);
+        const {
+            assert!(DEFAULT_GRPC_MAX_RECV_MSG_SIZE > GRPC_COMPILED_MAX_RECV_DEFAULT);
+        }
     }
 }
