@@ -105,6 +105,14 @@ fn parse_k8s_quantity(raw: &str) -> Result<usize, String> {
 /// `mul`, and round fractional byte results up.
 fn parse_decimal_quantity(num: &str, mul: u128, raw: &str) -> Result<u128, String> {
     let num = num.strip_prefix('+').unwrap_or(num);
+    let (integer, fraction) = split_decimal_parts(num, raw)?;
+    let integer = parse_u128_or_zero(integer, raw)?;
+    let (scale, fractional) = fractional_digits(fraction, raw)?;
+    scale_and_ceil(integer, scale, fractional, mul, raw)
+}
+
+/// Split `num` into integer and fractional digit strings.
+fn split_decimal_parts<'a>(num: &'a str, raw: &str) -> Result<(&'a str, &'a str), String> {
     let (integer, fraction) = num.split_once('.').unwrap_or((num, ""));
     if (integer.is_empty() && fraction.is_empty())
         || !integer.bytes().all(|b| b.is_ascii_digit())
@@ -112,15 +120,21 @@ fn parse_decimal_quantity(num: &str, mul: u128, raw: &str) -> Result<u128, Strin
     {
         return Err(format!("parse size: invalid quantity {raw:?}"));
     }
+    Ok((integer, fraction))
+}
 
-    let integer = if integer.is_empty() {
-        0
-    } else {
-        integer
-            .parse::<u128>()
-            .map_err(|_err| format!("size {raw:?} overflows"))?
-    };
+/// Parse an integer digit string, treating empty as zero.
+fn parse_u128_or_zero(integer: &str, raw: &str) -> Result<u128, String> {
+    if integer.is_empty() {
+        return Ok(0);
+    }
+    integer
+        .parse::<u128>()
+        .map_err(|_err| format!("size {raw:?} overflows"))
+}
 
+/// Convert fractional digits into `(scale, value)` where `value / scale` is the fraction.
+fn fractional_digits(fraction: &str, raw: &str) -> Result<(u128, u128), String> {
     let mut scale = 1u128;
     let mut fractional = 0u128;
     for digit in fraction.bytes() {
@@ -132,7 +146,11 @@ fn parse_decimal_quantity(num: &str, mul: u128, raw: &str) -> Result<u128, Strin
             .and_then(|value| value.checked_add(u128::from(digit - b'0')))
             .ok_or_else(|| format!("size {raw:?} overflows"))?;
     }
+    Ok((scale, fractional))
+}
 
+/// Compute `(integer + fractional/scale) * mul`, rounding up to whole bytes.
+fn scale_and_ceil(integer: u128, scale: u128, fractional: u128, mul: u128, raw: &str) -> Result<u128, String> {
     let scaled = integer
         .checked_mul(scale)
         .and_then(|value| value.checked_add(fractional))
