@@ -12,6 +12,7 @@ use clap::Parser;
 use praxis_extproc::{
     config::{self, ExtProcConfig},
     error::ExtProcError,
+    grpc_limits::{self, GRPC_MAX_RECV_MSG_SIZE_ENV},
     server::PraxisExtProc,
     tls,
 };
@@ -295,6 +296,15 @@ async fn serve_grpc(
     max_body: Option<usize>,
     drain_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Per-message tonic limit only (RHOAIENG-102139 / RHAI-13005). Does not
+    // bound cumulative body bytes reassembled across streamed chunks.
+    let max_recv = grpc_limits::resolve_grpc_max_recv_msg_size()?;
+    info!(
+        bytes = max_recv,
+        env = GRPC_MAX_RECV_MSG_SIZE_ENV,
+        "gRPC max decoding message size configured"
+    );
+
     // The latch fires when the drain deadline expires, forcing any streams still
     // running after graceful shutdown began to cancel.
     let (force_tx, force_rx) = tokio::sync::watch::channel(false);
@@ -303,7 +313,8 @@ async fn serve_grpc(
             .with_max_body_accumulation(max_body)
             .with_trust_forwarded_for(server_cfg.trust_forwarded_for)
             .with_force_shutdown(force_rx.clone()),
-    );
+    )
+    .max_decoding_message_size(max_recv);
     let drain = std::time::Duration::from_secs(server_cfg.shutdown_drain_timeout_secs.get());
     let controls = ShutdownControls {
         signal: Box::pin(shutdown_with_deadline(drain_rx, force_tx, drain)),

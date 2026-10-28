@@ -27,7 +27,11 @@
 )]
 #![allow(missing_docs, reason = "test module")]
 
-use praxis_extproc::{config, server::PraxisExtProc};
+use praxis_extproc::{
+    config,
+    grpc_limits::{self, DEFAULT_GRPC_MAX_RECV_MSG_SIZE, GRPC_COMPILED_MAX_RECV_DEFAULT},
+    server::PraxisExtProc,
+};
 use praxis_filter::{
     BodyAccess, BodyMode as FilterBodyMode, FilterAction, FilterError, FilterRegistry, HttpFilter, HttpFilterContext,
     SelectedUpstreamBodyOutcome,
@@ -194,6 +198,41 @@ async fn large_body_request_succeeds() {
 
     assert!(!has_immediate, "large body should not be rejected");
     assert!(!responses.is_empty(), "should produce responses for large body");
+}
+
+/// RHOAIENG-102139 regression: Envoy delivers a buffered request body as one
+/// gRPC message; tonic's compiled 4 MiB MaxRecv rejects it with an empty HTTP
+/// 500. Our default (32 MiB) must accept a body just over 4 MiB.
+#[tokio::test]
+async fn grpc_max_recv_accepts_body_above_four_mib() {
+    let payload = vec![b'x'; GRPC_COMPILED_MAX_RECV_DEFAULT + 64 * 1024];
+
+    let (mut client, _shutdown) =
+        start_server_with_max_recv(HEADERS_ONLY_CONFIG, DEFAULT_GRPC_MAX_RECV_MSG_SIZE).await;
+    let responses = send_full_request(&mut client, "POST", "/large-over-4mib", &payload).await;
+    assert!(
+        !responses.is_empty(),
+        "default max recv must accept a body just over 4 MiB"
+    );
+    assert!(
+        !responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::ImmediateResponse(_)))),
+        "body just over 4 MiB must not be rejected as immediate response"
+    );
+
+    let (mut client_limited, _shutdown) =
+        start_server_with_max_recv(HEADERS_ONLY_CONFIG, GRPC_COMPILED_MAX_RECV_DEFAULT).await;
+    let err = send_full_request_result(&mut client_limited, "POST", "/large-over-4mib", &payload)
+        .await
+        .expect_err("compiled 4 MiB limit must reject the oversized gRPC message");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("length too large")
+            || msg.contains("RESOURCE_EXHAUSTED")
+            || msg.contains("message size"),
+        "expected gRPC size rejection, got: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -2924,6 +2963,31 @@ async fn start_server_with_registry(
     config_yaml: &str,
     registry: FilterRegistry,
 ) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
+    start_server_with_registry_and_max_recv(
+        config_yaml,
+        registry,
+        grpc_limits::resolve_grpc_max_recv_msg_size().expect("resolve max recv"),
+    )
+    .await
+}
+
+async fn start_server_with_max_recv(
+    config_yaml: &str,
+    max_recv: usize,
+) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
+    start_server_with_registry_and_max_recv(
+        config_yaml,
+        praxis_ai_filters::build_ai_registry(),
+        max_recv,
+    )
+    .await
+}
+
+async fn start_server_with_registry_and_max_recv(
+    config_yaml: &str,
+    registry: FilterRegistry,
+    max_recv: usize,
+) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
     let cfg: config::ExtProcConfig = serde_yaml::from_str(config_yaml).expect("parse config");
     let pipeline = config::build_pipeline(&cfg, &registry).expect("build pipeline");
 
@@ -2935,7 +2999,9 @@ async fn start_server_with_registry(
 
     tokio::spawn(async move {
         Server::builder()
-            .add_service(ExternalProcessorServer::new(svc))
+            .add_service(
+                ExternalProcessorServer::new(svc).max_decoding_message_size(max_recv),
+            )
             .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
                 drop(shutdown_rx.await);
             })
@@ -2950,7 +3016,11 @@ async fn start_server_with_registry(
         .connect()
         .await
         .expect("connect");
-    let client = ExtProcClient::new(channel);
+    // Client send/recv limits stay at the raised default so tests can deliver
+    // bodies that only the *server* max_recv under test should reject.
+    let client = ExtProcClient::new(channel)
+        .max_decoding_message_size(DEFAULT_GRPC_MAX_RECV_MSG_SIZE)
+        .max_encoding_message_size(DEFAULT_GRPC_MAX_RECV_MSG_SIZE);
 
     (client, shutdown_tx)
 }
@@ -2976,10 +3046,21 @@ async fn send_full_request(
     path: &str,
     body: &[u8],
 ) -> Vec<ProcessingResponse> {
+    send_full_request_result(client, method, path, body)
+        .await
+        .expect("process call failed")
+}
+
+async fn send_full_request_result(
+    client: &mut ExtProcClient,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<Vec<ProcessingResponse>, tonic::Status> {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let stream = ReceiverStream::new(rx);
 
-    let response = client.process(stream).await.expect("process call failed");
+    let response = client.process(stream).await?;
     let mut inbound = response.into_inner();
 
     let has_body = !body.is_empty();
@@ -3001,7 +3082,7 @@ async fn send_full_request(
     }
 
     drop(tx);
-    collect_responses(&mut inbound).await
+    collect_responses_result(&mut inbound).await
 }
 
 async fn send_full_roundtrip(client: &mut ExtProcClient, method: &str, path: &str) -> Vec<ProcessingResponse> {
@@ -3106,14 +3187,27 @@ fn make_header(key: &str, value: &str) -> HeaderValue {
 }
 
 async fn collect_responses(inbound: &mut tonic::Streaming<ProcessingResponse>) -> Vec<ProcessingResponse> {
+    collect_responses_result(inbound)
+        .await
+        .expect("collect responses")
+}
+
+async fn collect_responses_result(
+    inbound: &mut tonic::Streaming<ProcessingResponse>,
+) -> Result<Vec<ProcessingResponse>, tonic::Status> {
     let mut responses = Vec::new();
     let timeout = tokio::time::Duration::from_secs(2);
 
-    while let Ok(Ok(Some(resp))) = tokio::time::timeout(timeout, inbound.message()).await {
-        responses.push(resp);
+    loop {
+        match tokio::time::timeout(timeout, inbound.message()).await {
+            Ok(Ok(Some(resp))) => responses.push(resp),
+            Ok(Ok(None)) => break,
+            Ok(Err(status)) => return Err(status),
+            Err(_) => break, // idle timeout: stream quiet
+        }
     }
 
-    responses
+    Ok(responses)
 }
 
 /// Collect streamed body chunks from a response stream.

@@ -338,6 +338,7 @@ RUST_LOG=praxis_extproc::server=trace praxis-extproc -c praxis-extproc.yaml
 | Variable | Description |
 | --- | --- |
 | `RUST_LOG` | Tracing filter (e.g. `info`, `debug`, `praxis_extproc=trace`) |
+| `GRPC_MAX_RECV_MSG_SIZE` | Per-gRPC-message receive limit for the ExtProc tonic server (bytes or a Kubernetes quantity such as `64Mi`). Default **32 MiB** (above tonic's compiled 4 MiB default) so multimodal / agent chat bodies do not fail with an empty HTTP 500 (`decoded message length too large`). Invalid values fail closed at startup. This does **not** replace `server.max_body_bytes` / `insecure_options.allow_unbounded_body`, which govern cumulative body accumulation across streamed chunks. |
 
 ## Example Configs
 
