@@ -7,7 +7,7 @@
 //! message. tonic's compiled default (`4 MiB`) rejects multimodal / agent
 //! chat bodies with `decoded message length too large`, which Envoy surfaces
 //! as an empty HTTP 500. The default here matches Go IPP / llm-d-router
-//! operator practice (`32 MiB`) while remaining a DoS bound.
+//! operator practice (`32 MiB`) while remaining a `DoS` bound.
 //!
 //! Override with [`GRPC_MAX_RECV_MSG_SIZE_ENV`] (plain bytes or a Kubernetes
 //! quantity such as `64Mi`). This is a **per-message** cap only; cumulative
@@ -30,26 +30,37 @@ pub const GRPC_COMPILED_MAX_RECV_DEFAULT: usize = 4 * 1024 * 1024;
 ///
 /// # Errors
 ///
-/// Returns an error when [`GRPC_MAX_RECV_MSG_SIZE_ENV`] is set to a non-empty
-/// value that is not a positive integer or Kubernetes quantity.
+/// Returns an error when [`GRPC_MAX_RECV_MSG_SIZE_ENV`] is set but is not valid
+/// Unicode, or is set to a non-empty value that is not a positive integer or
+/// Kubernetes quantity.
 pub fn resolve_grpc_max_recv_msg_size() -> Result<usize, String> {
-    resolve_grpc_max_recv_msg_size_from(env::var(GRPC_MAX_RECV_MSG_SIZE_ENV).ok().as_deref())
+    let raw = match env::var(GRPC_MAX_RECV_MSG_SIZE_ENV) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(error) => return Err(format!("{GRPC_MAX_RECV_MSG_SIZE_ENV}: {error}")),
+    };
+    resolve_grpc_max_recv_msg_size_from(raw.as_deref())
 }
 
 /// Resolve from an optional raw string (tests inject values without touching env).
+///
+/// # Errors
+///
+/// Returns an error when `raw` is a non-empty value that is not a positive
+/// integer or Kubernetes quantity.
 pub fn resolve_grpc_max_recv_msg_size_from(raw: Option<&str>) -> Result<usize, String> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(DEFAULT_GRPC_MAX_RECV_MSG_SIZE);
     };
 
-    let n = parse_msg_size_bytes(raw)
-        .map_err(|e| format!("{GRPC_MAX_RECV_MSG_SIZE_ENV}={raw:?}: {e}"))?;
+    let n = parse_msg_size_bytes(raw).map_err(|e| format!("{GRPC_MAX_RECV_MSG_SIZE_ENV}={raw:?}: {e}"))?;
     if n == 0 {
         return Err(format!("{GRPC_MAX_RECV_MSG_SIZE_ENV}={raw:?}: must be a positive size"));
     }
     Ok(n)
 }
 
+/// Parse a plain byte count or Kubernetes-style quantity into bytes.
 fn parse_msg_size_bytes(raw: &str) -> Result<usize, String> {
     // Prefer plain integers so operators can pass exact byte counts from logs
     // (e.g. the 4194304 from "decoded message length too large").
@@ -62,30 +73,27 @@ fn parse_msg_size_bytes(raw: &str) -> Result<usize, String> {
 
 /// Parse a subset of Kubernetes resource quantities used for byte sizes.
 ///
-/// Supports binary (`Ki`/`Mi`/`Gi`) and decimal (`K`/`M`/`G`) suffixes, matching
-/// what operators commonly set on `GRPC_MAX_RECV_MSG_SIZE` in the Go IPP image.
+/// Supports binary (`Ki`/`Mi`/`Gi`) and decimal (`k`/`K`/`M`/`G`) suffixes,
+/// including fractional numerics (e.g. `1.5Gi`), matching what operators
+/// commonly set on `GRPC_MAX_RECV_MSG_SIZE` in the Go IPP image.
 fn parse_k8s_quantity(raw: &str) -> Result<usize, String> {
+    // Longer suffixes first so `Ki` wins over `i` / `K`.
     const SUFFIXES: &[(&str, u128)] = &[
         ("Ki", 1024),
         ("Mi", 1024 * 1024),
         ("Gi", 1024 * 1024 * 1024),
         ("K", 1000),
+        ("k", 1000),
         ("M", 1000 * 1000),
         ("G", 1000 * 1000 * 1000),
     ];
 
     for &(suffix, mul) in SUFFIXES {
         if let Some(num) = raw.strip_suffix(suffix) {
-            let n: u128 = num
-                .trim()
-                .parse()
-                .map_err(|_| format!("parse size: invalid quantity {raw:?}"))?;
-            if n == 0 {
+            let bytes = parse_decimal_quantity(num.trim(), mul, raw)?;
+            if bytes == 0 {
                 return Err("size must be positive".into());
             }
-            let bytes = n
-                .checked_mul(mul)
-                .ok_or_else(|| format!("size {raw:?} overflows"))?;
             return u128_to_usize(bytes);
         }
     }
@@ -93,12 +101,60 @@ fn parse_k8s_quantity(raw: &str) -> Result<usize, String> {
     Err(format!("parse size: invalid quantity {raw:?}"))
 }
 
+/// Parse an optional leading `+`, integer and/or fractional digits, multiply by
+/// `mul`, and round fractional byte results up.
+fn parse_decimal_quantity(num: &str, mul: u128, raw: &str) -> Result<u128, String> {
+    let num = num.strip_prefix('+').unwrap_or(num);
+    let (integer, fraction) = num.split_once('.').unwrap_or((num, ""));
+    if (integer.is_empty() && fraction.is_empty())
+        || !integer.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(format!("parse size: invalid quantity {raw:?}"));
+    }
+
+    let integer = if integer.is_empty() {
+        0
+    } else {
+        integer
+            .parse::<u128>()
+            .map_err(|_err| format!("size {raw:?} overflows"))?
+    };
+
+    let mut scale = 1u128;
+    let mut fractional = 0u128;
+    for digit in fraction.bytes() {
+        scale = scale
+            .checked_mul(10)
+            .ok_or_else(|| format!("size {raw:?} overflows"))?;
+        fractional = fractional
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u128::from(digit - b'0')))
+            .ok_or_else(|| format!("size {raw:?} overflows"))?;
+    }
+
+    let scaled = integer
+        .checked_mul(scale)
+        .and_then(|value| value.checked_add(fractional))
+        .and_then(|value| value.checked_mul(mul))
+        .ok_or_else(|| format!("size {raw:?} overflows"))?;
+    let bytes = scaled / scale;
+    if scaled % scale == 0 {
+        Ok(bytes)
+    } else {
+        bytes
+            .checked_add(1)
+            .ok_or_else(|| format!("size {raw:?} overflows"))
+    }
+}
+
+/// Convert a byte count that fits in `u128` into `usize`.
 fn u128_to_usize(v: u128) -> Result<usize, String> {
-    usize::try_from(v).map_err(|_| format!("size {v} overflows usize"))
+    usize::try_from(v).map_err(|_err| format!("size {v} overflows usize"))
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+#[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -136,11 +192,40 @@ mod tests {
             resolve_grpc_max_recv_msg_size_from(Some("64M")).expect("decimal MB"),
             64 * 1000 * 1000
         );
+        assert_eq!(
+            resolve_grpc_max_recv_msg_size_from(Some("64k")).expect("lowercase decimal k"),
+            64 * 1000
+        );
+        assert_eq!(
+            resolve_grpc_max_recv_msg_size_from(Some("64K")).expect("uppercase decimal K"),
+            64 * 1000
+        );
+    }
+
+    #[test]
+    fn fractional_and_signed_quantities() {
+        assert_eq!(
+            resolve_grpc_max_recv_msg_size_from(Some("1.5Gi")).expect("1.5Gi"),
+            (3 * 1024 * 1024 * 1024) / 2
+        );
+        assert_eq!(
+            resolve_grpc_max_recv_msg_size_from(Some("+1Mi")).expect("+1Mi"),
+            1024 * 1024
+        );
+        assert_eq!(
+            resolve_grpc_max_recv_msg_size_from(Some(".5Ki")).expect(".5Ki"),
+            512
+        );
+        // 1.1 * 1000 = 1100 exactly after round-up of 1100/1? 1.1k = 1100
+        assert_eq!(
+            resolve_grpc_max_recv_msg_size_from(Some("1.1k")).expect("1.1k"),
+            1100
+        );
     }
 
     #[test]
     fn rejects_invalid() {
-        for raw in ["0", "-1", "lots", "Mi"] {
+        for raw in ["0", "-1", "lots", "Mi", "-1Mi"] {
             assert!(
                 resolve_grpc_max_recv_msg_size_from(Some(raw)).is_err(),
                 "expected error for {raw:?}"
