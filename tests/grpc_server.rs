@@ -201,14 +201,13 @@ async fn large_body_request_succeeds() {
 }
 
 /// RHOAIENG-102139 regression: Envoy delivers a buffered request body as one
-/// gRPC message; tonic's compiled 4 MiB MaxRecv rejects it with an empty HTTP
+/// gRPC message; tonic's compiled 4 MiB `MaxRecv` rejects it with an empty HTTP
 /// 500. Our default (32 MiB) must accept a body just over 4 MiB.
 #[tokio::test]
 async fn grpc_max_recv_accepts_body_above_four_mib() {
     let payload = vec![b'x'; GRPC_COMPILED_MAX_RECV_DEFAULT + 64 * 1024];
 
-    let (mut client, _shutdown) =
-        start_server_with_max_recv(HEADERS_ONLY_CONFIG, DEFAULT_GRPC_MAX_RECV_MSG_SIZE).await;
+    let (mut client, _shutdown) = start_server_with_max_recv(HEADERS_ONLY_CONFIG, DEFAULT_GRPC_MAX_RECV_MSG_SIZE).await;
     let responses = send_full_request(&mut client, "POST", "/large-over-4mib", &payload).await;
     assert!(
         !responses.is_empty(),
@@ -228,9 +227,7 @@ async fn grpc_max_recv_accepts_body_above_four_mib() {
         .expect_err("compiled 4 MiB limit must reject the oversized gRPC message");
     let msg = err.to_string();
     assert!(
-        msg.contains("length too large")
-            || msg.contains("RESOURCE_EXHAUSTED")
-            || msg.contains("message size"),
+        msg.contains("length too large") || msg.contains("RESOURCE_EXHAUSTED") || msg.contains("message size"),
         "expected gRPC size rejection, got: {msg}"
     );
 }
@@ -2975,12 +2972,7 @@ async fn start_server_with_max_recv(
     config_yaml: &str,
     max_recv: usize,
 ) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
-    start_server_with_registry_and_max_recv(
-        config_yaml,
-        praxis_ai_filters::build_ai_registry(),
-        max_recv,
-    )
-    .await
+    start_server_with_registry_and_max_recv(config_yaml, praxis_ai_filters::build_ai_registry(), max_recv).await
 }
 
 async fn start_server_with_registry_and_max_recv(
@@ -2999,9 +2991,7 @@ async fn start_server_with_registry_and_max_recv(
 
     tokio::spawn(async move {
         Server::builder()
-            .add_service(
-                ExternalProcessorServer::new(svc).max_decoding_message_size(max_recv),
-            )
+            .add_service(ExternalProcessorServer::new(svc).max_decoding_message_size(max_recv))
             .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
                 drop(shutdown_rx.await);
             })
@@ -3187,9 +3177,7 @@ fn make_header(key: &str, value: &str) -> HeaderValue {
 }
 
 async fn collect_responses(inbound: &mut tonic::Streaming<ProcessingResponse>) -> Vec<ProcessingResponse> {
-    collect_responses_result(inbound)
-        .await
-        .expect("collect responses")
+    collect_responses_result(inbound).await.expect("collect responses")
 }
 
 async fn collect_responses_result(
@@ -3201,9 +3189,9 @@ async fn collect_responses_result(
     loop {
         match tokio::time::timeout(timeout, inbound.message()).await {
             Ok(Ok(Some(resp))) => responses.push(resp),
-            Ok(Ok(None)) => break,
+            // Idle timeout (`Err`) means the stream went quiet.
+            Ok(Ok(None)) | Err(_) => break,
             Ok(Err(status)) => return Err(status),
-            Err(_) => break, // idle timeout: stream quiet
         }
     }
 

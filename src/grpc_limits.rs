@@ -138,9 +138,7 @@ fn fractional_digits(fraction: &str, raw: &str) -> Result<(u128, u128), String> 
     let mut scale = 1_u128;
     let mut fractional = 0_u128;
     for digit in fraction.bytes() {
-        scale = scale
-            .checked_mul(10)
-            .ok_or_else(|| format!("size {raw:?} overflows"))?;
+        scale = scale.checked_mul(10).ok_or_else(|| format!("size {raw:?} overflows"))?;
         fractional = fractional
             .checked_mul(10)
             .and_then(|value| value.checked_add(u128::from(digit - b'0')))
@@ -160,9 +158,7 @@ fn scale_and_ceil(integer: u128, scale: u128, fractional: u128, mul: u128, raw: 
     if scaled % scale == 0 {
         Ok(bytes)
     } else {
-        bytes
-            .checked_add(1)
-            .ok_or_else(|| format!("size {raw:?} overflows"))
+        bytes.checked_add(1).ok_or_else(|| format!("size {raw:?} overflows"))
     }
 }
 
@@ -230,15 +226,9 @@ mod tests {
             resolve_grpc_max_recv_msg_size_from(Some("+1Mi")).expect("+1Mi"),
             1024 * 1024
         );
-        assert_eq!(
-            resolve_grpc_max_recv_msg_size_from(Some(".5Ki")).expect(".5Ki"),
-            512
-        );
+        assert_eq!(resolve_grpc_max_recv_msg_size_from(Some(".5Ki")).expect(".5Ki"), 512);
         // 1.1 * 1000 = 1100 exactly after round-up of 1100/1? 1.1k = 1100
-        assert_eq!(
-            resolve_grpc_max_recv_msg_size_from(Some("1.1k")).expect("1.1k"),
-            1100
-        );
+        assert_eq!(resolve_grpc_max_recv_msg_size_from(Some("1.1k")).expect("1.1k"), 1100);
     }
 
     #[test]
