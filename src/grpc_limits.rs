@@ -135,8 +135,8 @@ fn parse_u128_or_zero(integer: &str, raw: &str) -> Result<u128, String> {
 
 /// Convert fractional digits into `(scale, value)` where `value / scale` is the fraction.
 fn fractional_digits(fraction: &str, raw: &str) -> Result<(u128, u128), String> {
-    let mut scale = 1u128;
-    let mut fractional = 0u128;
+    let mut scale = 1_u128;
+    let mut fractional = 0_u128;
     for digit in fraction.bytes() {
         scale = scale
             .checked_mul(10)
