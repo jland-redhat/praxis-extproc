@@ -27,10 +27,12 @@
 )]
 #![allow(missing_docs, reason = "test module")]
 
+use std::{path::PathBuf, process::Command};
+
 use praxis_extproc::{
     config,
-    grpc_limits::{self, DEFAULT_GRPC_MAX_RECV_MSG_SIZE, GRPC_COMPILED_MAX_RECV_DEFAULT},
-    server::PraxisExtProc,
+    grpc_limits::{DEFAULT_GRPC_MAX_RECV_MSG_SIZE, GRPC_COMPILED_MAX_RECV_DEFAULT, GRPC_MAX_RECV_MSG_SIZE_ENV},
+    server::{self, PraxisExtProc},
 };
 use praxis_filter::{
     BodyAccess, BodyMode as FilterBodyMode, FilterAction, FilterError, FilterRegistry, HttpFilter, HttpFilterContext,
@@ -200,18 +202,35 @@ async fn large_body_request_succeeds() {
     assert!(!responses.is_empty(), "should produce responses for large body");
 }
 
-/// RHOAIENG-102139 regression: Envoy delivers a buffered request body as one
-/// gRPC message; tonic's compiled 4 MiB `MaxRecv` rejects it with an empty HTTP
-/// 500. Our default (32 MiB) must accept a body just over 4 MiB.
-#[tokio::test]
-async fn grpc_max_recv_accepts_body_above_four_mib() {
+/// RHOAIENG-102139: the shipped binary's default (32 MiB) must accept a body
+/// just over tonic's compiled 4 MiB `MaxRecv`. Spawns `praxis-extproc` so the
+/// assertion exercises `serve_grpc` wiring, not the in-process harness.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_max_recv_binary_accepts_body_above_four_mib() {
     let payload = vec![b'x'; GRPC_COMPILED_MAX_RECV_DEFAULT + 64 * 1024];
+    let (grpc, health, metrics) = (free_port(), free_port(), free_port());
+    let config_path = write_grpc_max_recv_config(grpc, health, metrics);
 
-    let (mut client, _shutdown) = start_server_with_max_recv(HEADERS_ONLY_CONFIG, DEFAULT_GRPC_MAX_RECV_MSG_SIZE).await;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_praxis-extproc"))
+        .arg("-c")
+        .arg(&config_path)
+        .env_remove(GRPC_MAX_RECV_MSG_SIZE_ENV)
+        .spawn()
+        .expect("spawn praxis-extproc");
+
+    let mut client = connect_extproc_client(grpc).await;
     let responses = send_full_request(&mut client, "POST", "/large-over-4mib", &payload).await;
+
+    let kill = child.kill();
+    drop(std::fs::remove_file(&config_path));
+    kill.expect("kill praxis-extproc");
+    child.wait().expect("reap praxis-extproc");
+
     assert!(
-        !responses.is_empty(),
-        "default max recv must accept a body just over 4 MiB"
+        responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::RequestBody(_)))),
+        "default max recv must process the request body, got: {responses:?}"
     );
     assert!(
         !responses
@@ -219,16 +238,49 @@ async fn grpc_max_recv_accepts_body_above_four_mib() {
             .any(|r| matches!(&r.response, Some(RespVariant::ImmediateResponse(_)))),
         "body just over 4 MiB must not be rejected as immediate response"
     );
+}
 
-    let (mut client_limited, _shutdown) =
-        start_server_with_max_recv(HEADERS_ONLY_CONFIG, GRPC_COMPILED_MAX_RECV_DEFAULT).await;
-    let err = send_full_request_result(&mut client_limited, "POST", "/large-over-4mib", &payload)
+/// RHOAIENG-102139 control: tonic's compiled 4 MiB default (no
+/// `.max_decoding_message_size`) rejects a body just over that limit.
+#[tokio::test]
+async fn grpc_compiled_max_recv_rejects_body_above_four_mib() {
+    let payload = vec![b'x'; GRPC_COMPILED_MAX_RECV_DEFAULT + 64 * 1024];
+    let (mut client, _shutdown) = start_server_with_tonic_compiled_max_recv(HEADERS_ONLY_CONFIG).await;
+    let err = send_full_request_result(&mut client, "POST", "/large-over-4mib", &payload)
         .await
         .expect_err("compiled 4 MiB limit must reject the oversized gRPC message");
     let msg = err.to_string();
     assert!(
         msg.contains("length too large") || msg.contains("RESOURCE_EXHAUSTED") || msg.contains("message size"),
         "expected gRPC size rejection, got: {msg}"
+    );
+}
+
+/// Invalid `GRPC_MAX_RECV_MSG_SIZE` must fail `praxis-extproc -t` (same fail-
+/// closed path as serve).
+#[test]
+fn grpc_max_recv_invalid_fails_validate() {
+    let config = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/praxis-extproc.yaml");
+    let output = Command::new(env!("CARGO_BIN_EXE_praxis-extproc"))
+        .args(["-t", "-c"])
+        .arg(&config)
+        .env(GRPC_MAX_RECV_MSG_SIZE_ENV, "not-a-size")
+        .output()
+        .expect("run praxis-extproc -t");
+    assert!(
+        !output.status.success(),
+        "invalid {GRPC_MAX_RECV_MSG_SIZE_ENV} must fail validate, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains(GRPC_MAX_RECV_MSG_SIZE_ENV) || combined.contains("config:"),
+        "validate refusal should name the bad override, got: {combined}"
     );
 }
 
@@ -2960,19 +3012,9 @@ async fn start_server_with_registry(
     config_yaml: &str,
     registry: FilterRegistry,
 ) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
-    start_server_with_registry_and_max_recv(
-        config_yaml,
-        registry,
-        grpc_limits::resolve_grpc_max_recv_msg_size().expect("resolve max recv"),
-    )
-    .await
-}
-
-async fn start_server_with_max_recv(
-    config_yaml: &str,
-    max_recv: usize,
-) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
-    start_server_with_registry_and_max_recv(config_yaml, praxis_ai_filters::build_ai_registry(), max_recv).await
+    // Pin the shared harness to the crate default so ambient
+    // `GRPC_MAX_RECV_MSG_SIZE` cannot reshape unrelated tests.
+    start_server_with_registry_and_max_recv(config_yaml, registry, DEFAULT_GRPC_MAX_RECV_MSG_SIZE).await
 }
 
 async fn start_server_with_registry_and_max_recv(
@@ -2986,12 +3028,12 @@ async fn start_server_with_registry_and_max_recv(
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
-    let svc = PraxisExtProc::new(pipeline);
+    let svc = server::external_processor_server(PraxisExtProc::new(pipeline), max_recv);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
         Server::builder()
-            .add_service(ExternalProcessorServer::new(svc).max_decoding_message_size(max_recv))
+            .add_service(svc)
             .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
                 drop(shutdown_rx.await);
             })
@@ -3000,7 +3042,37 @@ async fn start_server_with_registry_and_max_recv(
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (extproc_client_for_addr(addr).await, shutdown_tx)
+}
 
+/// In-process server that leaves tonic's compiled 4 MiB max-recv untouched.
+async fn start_server_with_tonic_compiled_max_recv(
+    config_yaml: &str,
+) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
+    let cfg: config::ExtProcConfig = serde_yaml::from_str(config_yaml).expect("parse config");
+    let pipeline = config::build_pipeline(&cfg, &praxis_ai_filters::build_ai_registry()).expect("build pipeline");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
+                drop(shutdown_rx.await);
+            })
+            .await
+            .expect("server failed");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (extproc_client_for_addr(addr).await, shutdown_tx)
+}
+
+async fn extproc_client_for_addr(addr: std::net::SocketAddr) -> ExtProcClient {
     let channel = Channel::from_shared(format!("http://{addr}"))
         .expect("uri")
         .connect()
@@ -3008,11 +3080,52 @@ async fn start_server_with_registry_and_max_recv(
         .expect("connect");
     // Client send/recv limits stay at the raised default so tests can deliver
     // bodies that only the *server* max_recv under test should reject.
-    let client = ExtProcClient::new(channel)
+    ExtProcClient::new(channel)
         .max_decoding_message_size(DEFAULT_GRPC_MAX_RECV_MSG_SIZE)
-        .max_encoding_message_size(DEFAULT_GRPC_MAX_RECV_MSG_SIZE);
+        .max_encoding_message_size(DEFAULT_GRPC_MAX_RECV_MSG_SIZE)
+}
 
-    (client, shutdown_tx)
+/// Connect to a spawned `praxis-extproc` gRPC listener, retrying until ready.
+async fn connect_extproc_client(port: u16) -> ExtProcClient {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Ok(channel) = Channel::from_shared(format!("http://127.0.0.1:{port}"))
+            .expect("uri")
+            .connect()
+            .await
+        {
+            return ExtProcClient::new(channel)
+                .max_decoding_message_size(DEFAULT_GRPC_MAX_RECV_MSG_SIZE)
+                .max_encoding_message_size(DEFAULT_GRPC_MAX_RECV_MSG_SIZE);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "praxis-extproc never accepted connections on 127.0.0.1:{port}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Minimal serving config on free ports for the binary max-recv regression.
+fn write_grpc_max_recv_config(grpc: u16, health: u16, metrics: u16) -> PathBuf {
+    let yaml = format!(
+        "server:\n  grpc_address: \"127.0.0.1:{grpc}\"\n  health_address: \"127.0.0.1:{health}\"\n  \
+         metrics_address: \"127.0.0.1:{metrics}\"\n  tls:\n    mode: none\nfilter_chains:\n  - name: test\n    \
+         filters:\n      - filter: request_id\ninsecure_options:\n  allow_unbounded_body: true\n"
+    );
+    let path = std::env::temp_dir().join(format!(
+        "praxis-extproc-grpc-max-recv-{}-{grpc}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(&path, yaml).expect("write server config");
+    path
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|addr| addr.port())
+        .expect("find a free port")
 }
 
 async fn send_headers_only(client: &mut ExtProcClient, method: &str, path: &str) -> Vec<ProcessingResponse> {

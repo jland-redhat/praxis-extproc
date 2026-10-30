@@ -19,7 +19,8 @@ use std::{collections::HashMap, pin::Pin, sync::Arc, time::Instant};
 
 use praxis_filter::{FilterPipeline, HttpFilterContext, Request, Response};
 use praxis_proto::envoy::service::ext_proc::v3::{
-    ProcessingRequest, ProcessingResponse, ProtocolConfiguration, external_processor_server::ExternalProcessor,
+    ProcessingRequest, ProcessingResponse, ProtocolConfiguration,
+    external_processor_server::{ExternalProcessor, ExternalProcessorServer},
     processing_request,
 };
 use tokio::sync::{mpsc, watch};
@@ -116,6 +117,15 @@ impl PraxisExtProc {
         self.trust_forwarded_for = trust;
         self
     }
+}
+
+/// Build the tonic ExtProc service with the production max-decoding size.
+///
+/// The binary and in-process tests share this helper so the
+/// `.max_decoding_message_size(...)` wiring cannot drift between them.
+#[must_use]
+pub fn external_processor_server(svc: PraxisExtProc, max_recv: usize) -> ExternalProcessorServer<PraxisExtProc> {
+    ExternalProcessorServer::new(svc).max_decoding_message_size(max_recv)
 }
 
 /// Resolve only when the latch flips to `true`.

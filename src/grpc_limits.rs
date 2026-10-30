@@ -16,6 +16,12 @@
 
 use std::env;
 
+use crate::error::{ExtProcError, Result};
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
 /// Environment variable that overrides [`DEFAULT_GRPC_MAX_RECV_MSG_SIZE`].
 pub const GRPC_MAX_RECV_MSG_SIZE_ENV: &str = "GRPC_MAX_RECV_MSG_SIZE";
 
@@ -26,39 +32,58 @@ pub const DEFAULT_GRPC_MAX_RECV_MSG_SIZE: usize = 32 * 1024 * 1024;
 /// tonic / gRPC compiled default receive limit (bytes).
 pub const GRPC_COMPILED_MAX_RECV_DEFAULT: usize = 4 * 1024 * 1024;
 
+/// Kubernetes quantity suffixes, longer first so `Ki` wins over `K`.
+const SUFFIXES: &[(&str, u128)] = &[
+    ("Ki", 1024),
+    ("Mi", 1024 * 1024),
+    ("Gi", 1024 * 1024 * 1024),
+    ("K", 1000),
+    ("k", 1000),
+    ("M", 1000 * 1000),
+    ("G", 1000 * 1000 * 1000),
+];
+
+// -----------------------------------------------------------------------------
+// Public API
+// -----------------------------------------------------------------------------
+
 /// Resolve the ExtProc gRPC max decoding message size from the process env.
 ///
 /// # Errors
 ///
-/// Returns an error when [`GRPC_MAX_RECV_MSG_SIZE_ENV`] is set but is not valid
-/// Unicode, or is set to a non-empty value that is not a positive integer or
-/// Kubernetes quantity.
-pub fn resolve_grpc_max_recv_msg_size() -> Result<usize, String> {
+/// Returns [`ExtProcError::Config`] when [`GRPC_MAX_RECV_MSG_SIZE_ENV`] is set
+/// but is not valid Unicode, or is set to a non-empty value that is not a
+/// positive integer or Kubernetes quantity.
+pub fn resolve_grpc_max_recv_msg_size() -> Result<usize> {
     let raw = match env::var(GRPC_MAX_RECV_MSG_SIZE_ENV) {
         Ok(value) => Some(value),
         Err(env::VarError::NotPresent) => None,
-        Err(error) => return Err(format!("{GRPC_MAX_RECV_MSG_SIZE_ENV}: {error}")),
+        Err(error) => {
+            return Err(ExtProcError::Config(format!("{GRPC_MAX_RECV_MSG_SIZE_ENV}: {error}")));
+        },
     };
     resolve_grpc_max_recv_msg_size_from(raw.as_deref())
 }
 
 /// Resolve from an optional raw string (tests inject values without touching env).
-///
-/// # Errors
-///
-/// Returns an error when `raw` is a non-empty value that is not a positive
-/// integer or Kubernetes quantity.
-pub fn resolve_grpc_max_recv_msg_size_from(raw: Option<&str>) -> Result<usize, String> {
+pub(crate) fn resolve_grpc_max_recv_msg_size_from(raw: Option<&str>) -> Result<usize> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(DEFAULT_GRPC_MAX_RECV_MSG_SIZE);
     };
 
-    let n = parse_msg_size_bytes(raw).map_err(|e| format!("{GRPC_MAX_RECV_MSG_SIZE_ENV}={raw:?}: {e}"))?;
+    let n = parse_msg_size_bytes(raw)
+        .map_err(|e| ExtProcError::Config(format!("{GRPC_MAX_RECV_MSG_SIZE_ENV}={raw:?}: {e}")))?;
     if n == 0 {
-        return Err(format!("{GRPC_MAX_RECV_MSG_SIZE_ENV}={raw:?}: must be a positive size"));
+        return Err(ExtProcError::Config(format!(
+            "{GRPC_MAX_RECV_MSG_SIZE_ENV}={raw:?}: must be a positive size"
+        )));
     }
     Ok(n)
 }
+
+// -----------------------------------------------------------------------------
+// Parsing
+// -----------------------------------------------------------------------------
 
 /// Parse a plain byte count or Kubernetes-style quantity into bytes.
 fn parse_msg_size_bytes(raw: &str) -> Result<usize, String> {
@@ -77,17 +102,6 @@ fn parse_msg_size_bytes(raw: &str) -> Result<usize, String> {
 /// including fractional numerics (e.g. `1.5Gi`), matching what operators
 /// commonly set on `GRPC_MAX_RECV_MSG_SIZE` in the Go IPP image.
 fn parse_k8s_quantity(raw: &str) -> Result<usize, String> {
-    // Longer suffixes first so `Ki` wins over `i` / `K`.
-    const SUFFIXES: &[(&str, u128)] = &[
-        ("Ki", 1024),
-        ("Mi", 1024 * 1024),
-        ("Gi", 1024 * 1024 * 1024),
-        ("K", 1000),
-        ("k", 1000),
-        ("M", 1000 * 1000),
-        ("G", 1000 * 1000 * 1000),
-    ];
-
     for &(suffix, mul) in SUFFIXES {
         if let Some(num) = raw.strip_suffix(suffix) {
             let bytes = parse_decimal_quantity(num.trim(), mul, raw)?;
@@ -234,9 +248,10 @@ mod tests {
     #[test]
     fn rejects_invalid() {
         for raw in ["0", "-1", "lots", "Mi", "-1Mi"] {
+            let err = resolve_grpc_max_recv_msg_size_from(Some(raw)).expect_err("invalid");
             assert!(
-                resolve_grpc_max_recv_msg_size_from(Some(raw)).is_err(),
-                "expected error for {raw:?}"
+                matches!(err, ExtProcError::Config(_)),
+                "expected Config error for {raw:?}, got {err:?}"
             );
         }
     }
