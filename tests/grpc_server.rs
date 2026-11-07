@@ -202,7 +202,121 @@ async fn large_body_request_succeeds() {
     assert!(!responses.is_empty(), "should produce responses for large body");
 }
 
-/// RHOAIENG-102139: the shipped binary's default (32 MiB) must accept a body
+/// Request bodies over `server.max_body_bytes` must be `ImmediateResponse` 413,
+/// not a gRPC `RESOURCE_EXHAUSTED` that Envoy turns into an empty HTTP 500.
+#[tokio::test]
+async fn request_body_over_max_returns_immediate_413() {
+    let (mut client, _shutdown) = start_server(SMALL_BODY_LIMIT_CONFIG).await;
+    let body = vec![b'x'; 2048];
+    let responses = send_full_request(&mut client, "POST", "/too-large", &body).await;
+    assert!(
+        responses.iter().any(|response| matches!(
+            response.response.as_ref(),
+            Some(RespVariant::ImmediateResponse(reply))
+                if reply.status.as_ref().map(|status| status.code) == Some(413)
+        )),
+        "over-limit request body must be ImmediateResponse 413, got: {responses:?}"
+    );
+}
+
+/// After `ImmediateResponse` 413, the server must end its response stream even
+/// when the client keeps the request sender open (resource-lifetime guard).
+#[tokio::test]
+async fn immediate_413_ends_response_stream_while_client_input_stays_open() {
+    let (mut client, _shutdown) = start_server(SMALL_BODY_LIMIT_CONFIG).await;
+    let (tx, mut inbound) = open_stream(&mut client).await;
+
+    tx.send(make_request_headers("POST", "/too-large-open", false))
+        .await
+        .expect("send headers");
+    let header_resp = inbound.message().await.expect("recv").expect("headers response");
+    assert!(
+        matches!(&header_resp.response, Some(RespVariant::RequestHeaders(_))),
+        "headers phase must complete before the over-limit body, got: {header_resp:?}"
+    );
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: vec![b'x'; 2048],
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send over-limit body");
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+    let mut saw_413 = false;
+    let mut saw_eof = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_millis(200), inbound.message()).await {
+            Ok(Ok(Some(resp))) => {
+                if matches!(
+                    resp.response.as_ref(),
+                    Some(RespVariant::ImmediateResponse(reply))
+                        if reply.status.as_ref().map(|status| status.code) == Some(413)
+                ) {
+                    saw_413 = true;
+                }
+            },
+            Ok(Ok(None)) => {
+                saw_eof = true;
+                break;
+            },
+            Ok(Err(status)) => panic!("unexpected stream error before EOF: {status}"),
+            Err(_) => {},
+        }
+    }
+
+    assert!(
+        saw_413,
+        "must receive ImmediateResponse 413 while client input stays open"
+    );
+    assert!(
+        saw_eof,
+        "server must EOF the response stream after ImmediateResponse without waiting for client input EOF"
+    );
+    // Keep the request sender alive until after the assertions so this case
+    // cannot pass merely because the client closed the input stream.
+    drop(tx);
+}
+
+/// Framing headroom: a BUFFERED body exactly at `max_body_bytes` must reach the
+/// handler (not fail at tonic decode), and one byte over must be `ImmediateResponse` 413.
+#[tokio::test]
+async fn buffered_body_at_and_over_max_body_bytes() {
+    use praxis_extproc::config::DEFAULT_MAX_BODY_BYTES;
+
+    let (mut client, _shutdown) = start_server(DEFAULT_BODY_LIMIT_CONFIG).await;
+
+    let at_limit = vec![b'x'; DEFAULT_MAX_BODY_BYTES];
+    let accepted = send_full_request(&mut client, "POST", "/at-limit", &at_limit).await;
+    assert!(
+        accepted
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::RequestBody(_)))),
+        "exact max_body_bytes BUFFERED body must reach the handler, got: {accepted:?}"
+    );
+    assert!(
+        !accepted
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::ImmediateResponse(_)))),
+        "exact max_body_bytes body must not be rejected"
+    );
+
+    let over_limit = vec![b'x'; DEFAULT_MAX_BODY_BYTES + 1];
+    let rejected = send_full_request(&mut client, "POST", "/over-limit", &over_limit).await;
+    assert!(
+        rejected.iter().any(|response| matches!(
+            response.response.as_ref(),
+            Some(RespVariant::ImmediateResponse(reply))
+                if reply.status.as_ref().map(|status| status.code) == Some(413)
+        )),
+        "over max_body_bytes must be ImmediateResponse 413, got: {rejected:?}"
+    );
+}
+
+/// RHOAIENG-102139: the shipped binary's default recv ceiling must accept a body
 /// just over tonic's compiled 4 MiB `MaxRecv`. Spawns `praxis-extproc` so the
 /// assertion exercises `serve_grpc` wiring, not the in-process harness.
 #[tokio::test(flavor = "multi_thread")]
@@ -261,9 +375,7 @@ async fn grpc_compiled_max_recv_rejects_body_above_four_mib() {
 #[test]
 fn grpc_max_recv_invalid_fails_validate() {
     let config = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/praxis-extproc.yaml");
-    let output = Command::new(env!("CARGO_BIN_EXE_praxis-extproc"))
-        .args(["-t", "-c"])
-        .arg(&config)
+    let output = validate_command(&config)
         .env(GRPC_MAX_RECV_MSG_SIZE_ENV, "not-a-size")
         .output()
         .expect("run praxis-extproc -t");
@@ -281,6 +393,44 @@ fn grpc_max_recv_invalid_fails_validate() {
     assert!(
         combined.contains(GRPC_MAX_RECV_MSG_SIZE_ENV) || combined.contains("config:"),
         "validate refusal should name the bad override, got: {combined}"
+    );
+}
+
+#[test]
+fn invalid_listener_addresses_fail_validate() {
+    let config = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/praxis-extproc.yaml");
+
+    for flag in ["--grpc-address", "--health-address", "--metrics-address"] {
+        let output = validate_command(&config)
+            .args([flag, "not-an-address"])
+            .output()
+            .expect("run praxis-extproc -t");
+        let combined = command_output(&output);
+
+        assert!(
+            !output.status.success(),
+            "invalid {flag} must fail validate, got: {combined}"
+        );
+        assert!(
+            combined.contains("invalid socket address"),
+            "validate refusal should identify the invalid address, got: {combined}"
+        );
+    }
+}
+
+#[test]
+fn unusable_tls_files_fail_validate() {
+    let (_temp_dir, config) = write_invalid_tls_validate_config();
+    let output = validate_command(&config).output().expect("run praxis-extproc -t");
+    let combined = command_output(&output);
+
+    assert!(
+        !output.status.success(),
+        "unusable TLS files must fail validate, got: {combined}"
+    );
+    assert!(
+        combined.contains("certificate:"),
+        "validate refusal should identify the unusable certificate, got: {combined}"
     );
 }
 
@@ -2971,6 +3121,24 @@ insecure_options:
   allow_unbounded_body: true
 "#;
 
+const SMALL_BODY_LIMIT_CONFIG: &str = r#"
+server:
+  max_body_bytes: 1024
+filter_chains:
+  - name: test
+    filters:
+      - filter: request_id
+"#;
+
+/// Default `max_body_bytes` (32 MiB) with no `allow_unbounded_body`, for framing
+/// / accumulation boundary tests against the raised gRPC receive ceiling.
+const DEFAULT_BODY_LIMIT_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: request_id
+"#;
+
 const HEADERS_CONFIG: &str = r#"
 filter_chains:
   - name: test
@@ -3108,6 +3276,36 @@ filter_chains:
 type ExtProcClient =
     praxis_proto::envoy::service::ext_proc::v3::external_processor_client::ExternalProcessorClient<Channel>;
 
+fn command_output(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn validate_command(config: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_praxis-extproc"));
+    command.args(["-t", "-c"]).arg(config);
+    command
+}
+
+fn write_invalid_tls_validate_config() -> (tempfile::TempDir, PathBuf) {
+    let temp_dir = tempfile::tempdir().expect("create temporary directory");
+    let missing = temp_dir.path().join("missing-tls");
+    let yaml = format!(
+        "server:\n  grpc_address: \"127.0.0.1:50051\"\n  health_address: \"127.0.0.1:50052\"\n  \
+         metrics_address: \"127.0.0.1:9090\"\n  tls:\n    mode: provided\n    cert_path: \"{}.crt\"\n    \
+         key_path: \"{}.key\"\nfilter_chains:\n  - name: test\n    filters:\n      - filter: request_id\n\
+         insecure_options:\n  allow_unbounded_body: true\n",
+        missing.display(),
+        missing.display()
+    );
+    let path = temp_dir.path().join("config.yaml");
+    std::fs::write(&path, yaml).expect("write invalid TLS config");
+    (temp_dir, path)
+}
+
 async fn start_server(config_yaml: &str) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
     start_server_with_registry(config_yaml, praxis_ai_filters::build_ai_registry()).await
 }
@@ -3132,7 +3330,10 @@ async fn start_server_with_registry_and_max_recv(
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
-    let svc = server::external_processor_server(PraxisExtProc::new(pipeline), max_recv);
+    let svc = server::external_processor_server(
+        PraxisExtProc::new(pipeline).with_max_body_accumulation(cfg.max_body_accumulation()),
+        max_recv,
+    );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
@@ -3159,7 +3360,9 @@ async fn start_server_with_tonic_compiled_max_recv(
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
-    let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline));
+    let svc = ExternalProcessorServer::new(
+        PraxisExtProc::new(pipeline).with_max_body_accumulation(cfg.max_body_accumulation()),
+    );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
@@ -3211,11 +3414,15 @@ async fn connect_extproc_client(port: u16) -> ExtProcClient {
 }
 
 /// Minimal serving config on free ports for the binary max-recv regression.
+///
+/// `metrics_auth` is off: this process has no kubeconfig, and the default
+/// `enabled: true` exits before the gRPC listener starts.
 fn write_grpc_max_recv_config(grpc: u16, health: u16, metrics: u16) -> PathBuf {
     let yaml = format!(
         "server:\n  grpc_address: \"127.0.0.1:{grpc}\"\n  health_address: \"127.0.0.1:{health}\"\n  \
-         metrics_address: \"127.0.0.1:{metrics}\"\n  tls:\n    mode: none\nfilter_chains:\n  - name: test\n    \
-         filters:\n      - filter: request_id\ninsecure_options:\n  allow_unbounded_body: true\n"
+         metrics_address: \"127.0.0.1:{metrics}\"\n  metrics_auth:\n    enabled: false\n  tls:\n    mode: none\n\
+         filter_chains:\n  - name: test\n    filters:\n      - filter: request_id\n\
+         insecure_options:\n  allow_unbounded_body: true\n"
     );
     let path = std::env::temp_dir().join(format!(
         "praxis-extproc-grpc-max-recv-{}-{grpc}.yaml",
