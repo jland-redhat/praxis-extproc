@@ -13,7 +13,7 @@
 # Containerfile --target report. Builder and runtime match Containerfile.
 
 ARG UBI9_DIGEST=sha256:87f66688da4e206d5a1877088626c542288a5ccd97898cf363b588d57817e6be
-ARG UBI9_MINIMAL_PQC_DIGEST=sha256:ddaf8f8a845a39f7ab7d7caaed1bed0b9063eab6e22e52beece0924e91666c86
+ARG UBI9_MINIMAL_PQC_DIGEST=sha256:d638f3b49b79575329aacdae2739f954effe2467c12147711e73445c4fc97819
 
 # Mirrors FIPS_FEATURES in the Makefile and Containerfile.
 ARG CARGO_FEATURES="responses,aws-sigv4,store-postgres-cert-auth"
